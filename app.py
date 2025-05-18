@@ -52,8 +52,13 @@ filtered_df = df.copy()
 for col in df.columns:
     if col in id_cols:
         val = st.sidebar.text_input(f"Nhập {col} (để trống để hiện tất cả)")
-        if val:
+    if val:
+        try:
+            # Ép kiểu theo kiểu dữ liệu gốc của cột
+            val = df[col].dtype.type(val)
             filtered_df = filtered_df[filtered_df[col] == val]
+        except ValueError:
+            st.sidebar.warning(f"Giá trị nhập cho {col} không hợp lệ!")
     elif col in binary_cols:
         selected = st.sidebar.multiselect(f"Chọn {col}", ['0', '1'])
         if selected:
@@ -105,6 +110,10 @@ if os.path.exists(boxplot_dir):
 else:
     st.info("Chưa có thư mục 'boxplot' hoặc không tìm thấy.")
 
+import streamlit as st
+import pandas as pd
+import requests
+
 # ====== Phần dự đoán Churn bằng nhập dữ liệu mới ======
 st.header("🔍 Dự đoán churn cho khách hàng")
 
@@ -147,6 +156,47 @@ with st.form("predict_form"):
 
     submit = st.form_submit_button("Dự đoán Churn")
 
+def normalize_columns_for_api(df):
+    df = df.copy()
+
+    cat_cols = ['Geography', 'Gender', 'Card.Type']
+    for col in cat_cols:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.title().str.strip()
+
+    df_dummies = pd.get_dummies(df[cat_cols])
+    df_dummies.columns = [col.replace(' ', '').replace('_', '.').strip() for col in df_dummies.columns]
+
+    dummy_columns_model = [
+        'Geography.France', 'Geography.Germany', 'Geography.Spain',
+        'Gender.Female', 'Gender.Male',
+        'Card.Type.Diamond', 'Card.Type.Gold', 'Card.Type.Platinum', 'Card.Type.Silver'
+    ]
+    for col in dummy_columns_model:
+        if col not in df_dummies.columns:
+            df_dummies[col] = 0
+
+    numeric_cols = ['CreditScore', 'Age', 'Tenure', 'Balance', 'NumOfProducts',
+                    'HasCrCard', 'IsActiveMember', 'EstimatedSalary',
+                    'Complain', 'Satisfaction.Score', 'Point.Earned']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    df = df.drop(columns=cat_cols, errors='ignore')
+    final_df = pd.concat([df, df_dummies], axis=1)
+
+    return final_df
+
+def predict_with_api(input_df):
+    API_URL = "http://127.0.0.1:8000/predict"
+    payload = input_df.to_dict(orient='records')[0]
+    response = requests.post(API_URL, json=payload)
+    if response.status_code == 200:
+        return response.json().get('prediction', None)
+    else:
+        raise RuntimeError(f"API error {response.status_code}: {response.text}")
+
 if submit:
     input_data = {
         'CreditScore': credit_score,
@@ -166,49 +216,6 @@ if submit:
     }
 
     input_df = pd.DataFrame([input_data])
-
-    def normalize_columns_for_api(df):
-        df = df.copy()
-
-        cat_cols = ['Geography', 'Gender', 'Card.Type']
-        for col in cat_cols:
-            if col in df.columns:
-                df[col] = df[col].astype(str).str.title().str.strip()
-
-        df_dummies = pd.get_dummies(df[cat_cols])
-        df_dummies.columns = [col.replace(' ', '').replace('_', '.').strip() for col in df_dummies.columns]
-
-        dummy_columns_model = [
-            'Geography.France', 'Geography.Germany', 'Geography.Spain',
-            'Gender.Female', 'Gender.Male',
-            'Card.Type.Diamond', 'Card.Type.Gold', 'Card.Type.Platinum', 'Card.Type.Silver'
-        ]
-        for col in dummy_columns_model:
-            if col not in df_dummies.columns:
-                df_dummies[col] = 0
-
-        numeric_cols = ['CreditScore', 'Age', 'Tenure', 'Balance', 'NumOfProducts',
-                        'HasCrCard', 'IsActiveMember', 'EstimatedSalary',
-                        'Complain', 'Satisfaction.Score', 'Point.Earned']
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-
-        df = df.drop(columns=cat_cols, errors='ignore')
-
-        final_df = pd.concat([df, df_dummies], axis=1)
-
-        return final_df
-
-    def predict_with_api(input_df):
-        API_URL = "http://127.0.0.1:8000/predict"
-        payload = input_df.to_dict(orient='records')[0]
-        response = requests.post(API_URL, json=payload)
-        if response.status_code == 200:
-            return response.json().get('prediction', None)
-        else:
-            raise RuntimeError(f"API error {response.status_code}: {response.text}")
-
     proc = normalize_columns_for_api(input_df)
     st.write("Dữ liệu gửi lên API:", proc.to_dict(orient='records')[0])
     try:
@@ -216,3 +223,45 @@ if submit:
         st.success(f"🔮 Xác suất khách hàng rời đi: {proba}")
     except Exception as e:
         st.error(f"❌ Lỗi khi gọi API: {e}")
+
+# ====== Phần upload file CSV và dự đoán hàng loạt ======
+st.markdown("---")
+st.header("📁 Dự đoán churn từ file CSV")
+
+uploaded_file = st.file_uploader("Tải lên file CSV chứa danh sách khách hàng", type=["csv"])
+
+if uploaded_file is not None:
+    try:
+        df_csv = pd.read_csv(uploaded_file)
+
+        st.write("📄 Dữ liệu đọc được từ file:")
+        st.dataframe(df_csv.head())
+
+        df_preprocessed = normalize_columns_for_api(df_csv)
+
+        st.write("📦 Dữ liệu sau khi xử lý gửi đến API:")
+        st.dataframe(df_preprocessed.head())
+
+        st.write("⏳ Đang dự đoán cho từng khách hàng...")
+        results = []
+        for i in range(len(df_preprocessed)):
+            try:
+                payload = df_preprocessed.iloc[i].to_dict()
+                response = requests.post("http://127.0.0.1:8000/predict", json=payload)
+                if response.status_code == 200:
+                    pred = response.json().get('prediction', None)
+                    results.append(pred)
+                else:
+                    results.append("Lỗi")
+            except:
+                results.append("Lỗi")
+
+        df_csv['Churn_Probability'] = results
+        st.success("✅ Dự đoán thành công! Kết quả:")
+        st.dataframe(df_csv)
+
+        csv_output = df_csv.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Tải kết quả về CSV", data=csv_output, file_name="churn_predictions.csv", mime="text/csv")
+
+    except Exception as e:
+        st.error(f"❌ Lỗi khi xử lý file: {e}")
